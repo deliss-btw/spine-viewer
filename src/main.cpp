@@ -535,7 +535,7 @@ int main(int argc, char* argv[]) {
 	bool usingJson = false;
 
 	if (argc == 4) {
-		if (strcmp(argv[2], "--json") != 0 || strcmp(argv[2], "-j") != 0) {
+		if (strcmp(argv[2], "--json") != 0 && strcmp(argv[2], "-j") != 0) {
 			printUsage(argv[0]);
 			return 1;
 		}
@@ -545,7 +545,7 @@ int main(int argc, char* argv[]) {
 	SkeletonRenderer* skeleton = nullptr;
 
 	try {
-		skeleton = new SkeletonRenderer(argv[1], argv[2], usingJson);
+		skeleton = new SkeletonRenderer(argv[1], usingJson ? argv[3] : argv[2], usingJson);
 	}
 	catch (std::runtime_error& e) {
 		printf("Couldn't load the skeleton: %s", e.what());

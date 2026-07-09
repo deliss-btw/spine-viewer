@@ -24,6 +24,7 @@ struct SVState {
 	float zoom = 1;
 	bool loop = true;
 	bool isPaused = false;
+	bool isSeeking = false;
 	bool usePremultiplyAlpha = true;
 	spine::String currentAnimation;
 	spine::String currentSkin;
@@ -499,6 +500,14 @@ public:
 		return tracks[0]->getAnimationEnd();
 	}
 
+	void seekToTime(float time) {
+		setAnimCurrentTime(time);
+
+		drawable.state->update(0.f);
+		drawable.state->apply(*drawable.skeleton);
+		drawable.skeleton->updateWorldTransform();
+	}
+
 	void setSkeletonPosition(sf::Vector2f pos) {
 		skeletonPosition = pos;
 		drawable.skeleton->setPosition(pos.x, pos.y);
@@ -696,8 +705,11 @@ void controlWindow(SVState& state, SkeletonRenderer* skeleton) {
 		skeleton->setAnimCurrentTime(0.f);
 	}
 
+	state.isSeeking = false;
+
 	if (ImGui::SliderFloat("Time", &state.time, 0, skeleton->getAnimDuration(), "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
-		skeleton->setAnimCurrentTime(state.time);
+		state.isSeeking = true;
+		skeleton->seekToTime(state.time);
 	}
 	ImGui::DragFloat("TimeScale", &skeleton->getTimeScaleRef(), 0.05f, 0.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	ImGui::Checkbox("Loop", &state.loop);
@@ -915,7 +927,12 @@ int main(int argc, char* argv[]) {
 		skeleton->recordingPath = state.recordingPath;
 
 		skeleton->update(deltaF);
-		state.time = skeleton->getAnimCurrentTime();
+		if (!state.isSeeking) {
+			state.time = skeleton->getAnimCurrentTime();
+		}
+		if (!ImGui::IsItemActive()) {
+			state.time = skeleton->getAnimCurrentTime();
+		}
 
 		window.clear();
 		skeleton->render(window);

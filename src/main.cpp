@@ -3,6 +3,12 @@
 #include <SFML/Window.hpp>
 #include <SFML/Graphics.hpp>
 
+#ifndef GLEW_STATIC
+#define GLEW_STATIC
+#endif
+
+#include <GL/glew.h>
+
 #include <imgui.h>
 #include <imgui-SFML.h>
 
@@ -17,6 +23,7 @@ struct SVState {
 	sf::Vector2f position;
 	float zoom = 1;
 	bool loop = true;
+	bool isPaused = false;
 	bool usePremultiplyAlpha = true;
 	spine::String currentAnimation;
 	spine::String currentSkin;
@@ -129,6 +136,147 @@ sf::FloatRect getMaxSkeletonBounds(
 	return sf::FloatRect(sbX, sbY, sbW, sbH);
 }
 
+class FFmpegPBORecorder {
+public:
+	static constexpr int PBO_COUNT = 3;
+
+private:
+	GLuint pbos[PBO_COUNT]{};
+	int width = 0;
+	int height = 0;
+	int frameSize = 0;
+	int writeIndex = 0;
+	int pendingFrames = 0;
+
+	FILE* pipe = nullptr;
+	bool active = false;
+
+public:
+	bool start(int w, int h, float fps, const std::string& outputPath) {
+		width = w;
+		height = h;
+		frameSize = width * height * 4;
+		writeIndex = 0;
+		pendingFrames = 0;
+
+		std::string cmd =
+			"ffmpeg -y "
+			"-f rawvideo "
+			"-pix_fmt rgba "
+			"-s " + std::to_string(width) + "x" + std::to_string(height) + " "
+			"-r " + std::to_string((int)fps) + " "
+			"-i - "
+			"-vf vflip,format=yuv420p "
+			"-c:v libx264 "
+			"-preset veryfast "
+			"-crf 18 "
+			"\"" + outputPath + "\"";
+
+#ifdef _WIN32
+		pipe = _popen(cmd.c_str(), "wb");
+#else
+		pipe = popen(cmd.c_str(), "w");
+#endif
+
+		if (!pipe) {
+			printf("Failed to start ffmpeg\n");
+			return false;
+		}
+
+		glGenBuffers(PBO_COUNT, pbos);
+
+		for (int i = 0; i < PBO_COUNT; i++) {
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[i]);
+			glBufferData(GL_PIXEL_PACK_BUFFER, frameSize, nullptr, GL_STREAM_READ);
+		}
+
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+		active = true;
+		return true;
+	}
+
+	void captureTexture(GLuint textureId) {
+		if (!active) return;
+
+		int readIndex = (writeIndex + 1) % PBO_COUNT;
+
+		if (pendingFrames >= PBO_COUNT - 1) {
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[readIndex]);
+
+			void* ptr = glMapBufferRange(
+				GL_PIXEL_PACK_BUFFER,
+				0,
+				frameSize,
+				GL_MAP_READ_BIT
+			);
+
+			if (ptr) {
+				fwrite(ptr, 1, frameSize, pipe);
+				glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+			}
+		}
+		else {
+			pendingFrames++;
+		}
+
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[writeIndex]);
+		glBindTexture(GL_TEXTURE_2D, textureId);
+
+		glGetTexImage(
+			GL_TEXTURE_2D,
+			0,
+			GL_RGBA,
+			GL_UNSIGNED_BYTE,
+			nullptr
+		);
+
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+		writeIndex = (writeIndex + 1) % PBO_COUNT;
+	}
+
+	void stop() {
+		if (!active) return;
+
+		for (int i = 0; i < PBO_COUNT - 1; i++) {
+			int readIndex = (writeIndex + i) % PBO_COUNT;
+
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[readIndex]);
+
+			void* ptr = glMapBufferRange(
+				GL_PIXEL_PACK_BUFFER,
+				0,
+				frameSize,
+				GL_MAP_READ_BIT
+			);
+
+			if (ptr) {
+				fwrite(ptr, 1, frameSize, pipe);
+				glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+			}
+		}
+
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+		glDeleteBuffers(PBO_COUNT, pbos);
+
+#ifdef _WIN32
+		_pclose(pipe);
+#else
+		pclose(pipe);
+#endif
+
+		pipe = nullptr;
+		active = false;
+	}
+
+	bool isActive() const {
+		return active;
+	}
+};
+
 class SkeletonRenderer {
 	SkeletonBundle bundle;
 	spine::SkeletonDrawable drawable;
@@ -139,6 +287,9 @@ class SkeletonRenderer {
 	sf::FloatRect maxBounds;
 	sf::Vector2f skeletonPosition;
 
+	FFmpegPBORecorder videoRecorder;
+
+	bool isPaused = false;
 	bool isRecording = false;
 	float recordingFrameTime = 1.f / 30.f;
 	unsigned int currentRecordingFrame = 0;
@@ -359,22 +510,26 @@ public:
 	
 	void update(float delta) {
 		if (!isRecording) {
-			drawable.update(delta);
+			if (!isPaused) {
+				drawable.update(delta);
+			}
 			return;
 		}
 
-		fs::path filename = recordingPath;
-		filename /= getCurrentAnimation()->getName().buffer();
-		filename += "_" + std::to_string(currentRecordingFrame) + ".png";
-		auto renderedImage = renderTexture.getTexture().copyToImage();
-		renderedImage.saveToFile(filename.string());
+		renderInternalTexture();
+
+		GLuint textureId = renderTexture.getTexture().getNativeHandle();
+		videoRecorder.captureTexture(textureId);
 
 		currentRecordingFrame++;
 		drawable.update(recordingFrameTime);
+
 		float currentTime = getTracks()[0]->getTrackTime();
+
 		if (currentTime >= getAnimDuration()) {
 			isRecording = false;
-			// Restore the initial texture scale after recording is done
+			videoRecorder.stop();
+
 			if (renderScale != 1) {
 				drawable.skeleton->setScaleX(1.f);
 				drawable.skeleton->setScaleY(1.f);
@@ -399,8 +554,12 @@ public:
 			return true;
 		}
 
+		if (!state && isRecording) {
+			videoRecorder.stop();
+		}
+
 		if (state && !fs::is_directory(recordingPath)) {
-			printf("The supplied recording path '%s' is not a directory! Check the path for errors and make sure the directory exists.\n", recordingPath.c_str());
+			printf("The supplied recording path '%s' is not a directory!\n", recordingPath.c_str());
 			return false;
 		}
 
@@ -408,16 +567,36 @@ public:
 
 		if (state) {
 			currentRecordingFrame = 0;
+
 			if (renderScale != 1) {
 				drawable.skeleton->setScaleX(renderScale);
 				drawable.skeleton->setScaleY(renderScale);
 				updateRenderTexture();
 			}
+
 			setAnimCurrentTime(0.f);
 			setTimeScale(1.f);
 			drawable.update(0.f);
 			setLoop(false);
 			renderInternalTexture();
+
+			fs::path output = recordingPath;
+			output /= getCurrentAnimation()->getName().buffer();
+			output += ".mp4";
+
+			auto size = getTextureSize();
+
+			bool ok = videoRecorder.start(
+				(int)size.x,
+				(int)size.y,
+				getRecordingFPS(),
+				output.string()
+			);
+
+			if (!ok) {
+				isRecording = false;
+				return false;
+			}
 		}
 
 		return true;
@@ -427,6 +606,14 @@ public:
 		return isRecording;
 	}
 
+	void setPaused(bool paused) {
+		isPaused = paused;
+	}
+
+	bool getPaused() const {
+		return isPaused;
+	}
+
 	void render(sf::RenderWindow& window) {
 		renderInternalTexture();
 
@@ -434,6 +621,29 @@ public:
 		if (drawBorder) {
 			window.draw(border);
 		}
+	}
+
+	std::string makeCurrentFramePNGPath() {
+		fs::path output = recordingPath;
+
+		std::string animName = "animation";
+		if (getCurrentAnimation()) {
+			animName = getCurrentAnimation()->getName().buffer();
+		}
+
+		int timeMs = (int)(getAnimCurrentTime() * 1000.f);
+
+		output /= animName + "_frame_" + std::to_string(timeMs) + "ms.png";
+
+		return output.string();
+	}
+
+	bool exportCurrentFramePNG(const std::string& outputPath) {
+		renderInternalTexture();
+
+		sf::Image image = renderTexture.getTexture().copyToImage();
+
+		return image.saveToFile(outputPath);
 	}
 };
 
@@ -475,7 +685,20 @@ void controlWindow(SVState& state, SkeletonRenderer* skeleton) {
 
 	ImGui::Begin("Animation Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
-	ImGui::SliderFloat("Time", &state.time, 0, skeleton->getAnimDuration(), "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	if (ImGui::Button(state.isPaused ? "Resume" : "Pause")) {
+		state.isPaused = !state.isPaused;
+	}
+
+	ImGui::SameLine();
+
+	if (ImGui::Button("Restart")) {
+		state.time = 0.f;
+		skeleton->setAnimCurrentTime(0.f);
+	}
+
+	if (ImGui::SliderFloat("Time", &state.time, 0, skeleton->getAnimDuration(), "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+		skeleton->setAnimCurrentTime(state.time);
+	}
 	ImGui::DragFloat("TimeScale", &skeleton->getTimeScaleRef(), 0.05f, 0.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	ImGui::Checkbox("Loop", &state.loop);
 
@@ -493,6 +716,21 @@ void recordingWindow(SVState& state, SkeletonRenderer* skeleton) {
 	if (!state.isRecording) {
 		if (ImGui::Button("Record", maxWidth)) {
 			state.isRecording = true;
+		}
+		if (ImGui::Button("Export Current Frame PNG", maxWidth)) {
+			if (!fs::is_directory(skeleton->recordingPath)) {
+				printf("Invalid export path: %s\n", skeleton->recordingPath.c_str());
+			}
+			else {
+				std::string output = skeleton->makeCurrentFramePNGPath();
+
+				if (!skeleton->exportCurrentFramePNG(output)) {
+					printf("Failed to export PNG: %s\n", output.c_str());
+				}
+				else {
+					printf("Exported PNG: %s\n", output.c_str());
+				}
+			}
 		}
 		ImGui::DragFloat("FPS", &state.recordingFPS, 1.0f, 0.01f, 60.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		ImGui::DragFloat("Render Scale", &skeleton->renderScale, 0.05f, 0.01f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -556,6 +794,13 @@ int main(int argc, char* argv[]) {
 	state.position = skeleton->getSkeletonPosition();
 
 	sf::RenderWindow window(sf::VideoMode(1280, 720), "Spine Viewer");
+	window.setActive(true);
+
+	glewExperimental = GL_TRUE;
+	if (glewInit() != GLEW_OK) {
+		printf("GLEW init failed\n");
+		return 1;
+	}
 	sf::Clock deltaClock;
 
 	ImGui::SFML::Init(window);
@@ -655,7 +900,7 @@ int main(int argc, char* argv[]) {
 		if (!state.isRecording) {
 			controlWindow(state, skeleton);
 		}
-		skeleton->setAnimCurrentTime(state.time);
+		skeleton->setPaused(state.isPaused);
 		skeleton->setLoop(state.loop);
 
 		state.isRecording = skeleton->getIsRecording();
